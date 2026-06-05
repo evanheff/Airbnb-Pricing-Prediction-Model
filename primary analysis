@@ -1,0 +1,461 @@
+```{r}
+# PACKAGES AND DATA LOADING
+library(tidyverse)
+library(caret)
+library(car)
+library(glmnet)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(vip)
+library(dplyr)
+
+set.seed(1)
+
+train_path <- *provided train CSV*
+test_path  <- *provided test CSV*
+ 
+df_train <- read.csv(train_path, stringsAsFactors = FALSE)
+df_test <- read.csv(test_path,  stringsAsFactors = FALSE)
+ 
+cat("Train:", nrow(df_train), "rows", ncol(df_train), "columns\n")
+cat("Test:", nrow(df_test),"rows", ncol(df_test), "columns\n")
+```
+
+```{r}
+# EXPLORATORY DATA ANALYSIS
+
+# 1A. Overview and missing values
+skimr::skim(df_train)
+sort(table(df_train$neighbourhood_cleansed), decreasing = TRUE)
+cat("\nMissing values per column:\n")
+print(colSums(is.na(df_train)))
+ 
+# 1B. Price distribution: raw vs log transformation
+# Price is heavily right-skewed (mean ~$170, max ~$5,550, so modelling on log scale adjusts for non-normal distribution
+price_raw_plot <- ggplot(df_train, aes(x = price)) +
+  geom_histogram(bins = 60, fill = "steelblue", color = "white") +
+  labs(title = "Distribution of Nightly Price (Raw)",
+       x = "Price (USD)", y = "Count") +
+  theme_minimal()
+ 
+price_log_plot <- ggplot(df_train, aes(x = log(price))) +
+  geom_histogram(bins = 60, fill = "maroon", color = "white") +
+  labs(title = "Distribution of log(Price)",
+       x = "log(Price)", y = "Count") +
+  theme_minimal()
+ 
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  library(patchwork)
+  print(price_raw_plot + price_log_plot)
+} else {
+  print(price_raw_plot)
+  print(price_log_plot)
+}
+ 
+cat("Price range: $", min(df_train$price), "to $", max(df_train$price), "\n")
+cat("99th percentile: $", quantile(df_train$price, 0.99), "\n")
+ 
+# 1C. log(Price) by room type 
+ggplot(df_train, aes(x = reorder(room_type, price, median),
+                     y = log(price), fill = room_type)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  labs(title = "log(Price) by Room Type", y = "log(Price)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+ 
+# 1D. log(Price) by neighborhood
+ggplot(df_train,
+       aes(x = reorder(neighbourhood_cleansed, price, median), y = log(price))) +
+  geom_boxplot(fill = "steelblue", outlier.alpha = 0.2) +
+  coord_flip() +
+  labs(title = "log(Price) by neighborhood", y = "log(Price)") +
+  theme_minimal()
+ 
+#  1E. log(Price) vs key numeric predictors
+ggplot(df_train, aes(x = accommodates, y = log(price))) +
+  geom_jitter(alpha = 0.2, color = "steelblue", width = 0.2) +
+  geom_smooth(method = "loess", color = "maroon", se = TRUE) +
+  labs(title = "log(Price) vs Accommodates",
+       x = "Max Guests", y = "log(Price)") +
+  theme_minimal()
+ 
+ggplot(df_train, aes(x = dist_to_downtown, y = log(price))) +
+  geom_point(alpha = 0.2, color = "steelblue") +
+  geom_smooth(method = "loess", color = "maroon", se = TRUE) +
+  labs(title = "log(Price) vs log(Distance to Downtown)",
+       x = "dist_to_downtown", y = "log(Price)") +
+  theme_minimal()
+ 
+# 1F. Correlation
+num_vars <- df_train %>% select(where(is.numeric))
+cor_matrix <- cor(num_vars, use = "complete.obs")
+ 
+cor_long <- as.data.frame(cor_matrix) %>%
+  rownames_to_column("Var1") %>%
+  pivot_longer(-Var1, names_to = "Var2", values_to = "Correlation")
+ 
+ggplot(cor_long, aes(x = Var1, y = Var2, fill = Correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "maroon",
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(title = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# PREPROCESSING
+
+# 2A. Remove extreme price outliers (train only): several high-luxury listings skew the data
+price_cap <- quantile(df_train$price, 0.99)
+df_train  <- df_train %>% filter(price <= price_cap)
+cat("Observations after removing outliers above 99th percentile:", nrow(df_train), "\n")
+ 
+# 2B. Log-transform the target 
+df_train <- df_train %>% mutate(log_price = log(price))
+ 
+# 2C. Log-transform right-skewed predictors
+skewed_preds <- c("minimum_nights", "number_of_reviews",
+                  "calculated_host_listings_count", "dist_to_downtown")
+ 
+df_train <- df_train %>%
+  mutate(across(all_of(skewed_preds), ~ log(. + 1), .names = "log_{col}"))
+df_test  <- df_test  %>%
+  mutate(across(all_of(skewed_preds), ~ log(. + 1), .names = "log_{col}"))
+ 
+# 2D. Encode categoricals as factors 
+cat_vars <- c("neighbourhood_cleansed", "room_type", "host_is_superhost", "instant_bookable", "host_identity_verified")
+ 
+df_train <- df_train %>% mutate(across(all_of(cat_vars), as.factor))
+df_test <- df_test  %>% mutate(across(all_of(cat_vars), as.factor))
+ 
+for (v in cat_vars) {
+  all_levels <- union(levels(df_train[[v]]), levels(df_test[[v]]))
+  df_train[[v]] <- factor(df_train[[v]], levels = all_levels)
+  df_test[[v]] <- factor(df_test[[v]],  levels = all_levels)
+}
+ 
+# 2E. Define final feature set
+features <- c("neighbourhood_cleansed", "room_type", "bathrooms", "bedrooms", "accommodates", "availability_365", "review_scores_rating", "review_scores_cleanliness", "review_scores_location", "host_is_superhost", "instant_bookable", "host_identity_verified", "log_minimum_nights", "log_number_of_reviews", "log_calculated_host_listings_count", "log_dist_to_downtown")
+ 
+# Factor data frame
+X_train_df <- df_train[, features]
+y_train <- df_train$log_price
+X_test_df <- df_test[, features]
+
+dv <- dummyVars(~ ., data = X_train_df, fullRank = TRUE)
+X_mat_train <- predict(dv, newdata = X_train_df)
+X_mat_test <- predict(dv, newdata = X_test_df)
+ 
+# Shared 5-fold control used by every model
+cv_ctrl <- trainControl(method = "cv", number = 5, verboseIter = FALSE)
+cat("Training features:", ncol(X_mat_train), "columns after encoding\n")
+```
+
+```{r}
+# LINEAR MODELS (OLS, Ridge, LASSO, Elastic Net)
+
+# Model 1: OLS 
+ols_model <- train(
+  x = X_mat_train,
+  y = y_train,
+  method = "lm",
+  trControl = cv_ctrl
+)
+
+cat("OLS CV MSE:", round(min(ols_model$results$RMSE)^2, 4), "\n")
+ 
+vif_vals <- vif(ols_model$finalModel)
+vif_df <- data.frame(Predictor = names(vif_vals), VIF = as.numeric(vif_vals))
+ 
+ggplot(vif_df, aes(x = reorder(Predictor, VIF), y = VIF, fill = VIF > 5)) +
+  geom_col() +
+  geom_hline(yintercept = 5, linetype = "dashed", color = "black") +
+  scale_fill_manual(values = c("FALSE" = "steelblue", "TRUE" = "maroon"),
+                    guide = "none") +
+  coord_flip() +
+  labs(title = "OLS: Variance Inflation Factors", y = "VIF") +
+  theme_minimal()
+ 
+# Model 2: Ridge
+ridge_model <- train(
+  x = X_mat_train,
+  y = y_train,
+  method = "glmnet",
+  trControl = cv_ctrl,
+  tuneGrid = expand.grid(alpha  = 0, lambda = 10^seq(-3, 2, length.out = 60))
+)
+
+cat("Ridge (Best lambda):", round(ridge_model$bestTune$lambda, 5),
+    "CV MSE:", round(min(ridge_model$results$RMSE)^2, 4), "\n")
+
+ggplot(ridge_model$results %>% mutate(MSE = RMSE^2),
+       aes(x = log10(lambda), y = MSE)) +
+  geom_line(color = "steelblue") +
+  geom_vline(xintercept = log10(ridge_model$bestTune$lambda),
+             linetype = "dashed", color = "black") +
+  labs(title = "Ridge: CV MSE vs log10(lambda)",
+       subtitle = "Black line = selected lambda",
+       x = "log10(lambda)", y = "MSE") +
+  theme_minimal()
+ 
+# Model 3: LASSO 
+lasso_model <- train(
+  x  = X_mat_train,
+  y  = y_train,
+  method = "glmnet",
+  trControl = cv_ctrl,
+  tuneGrid  = expand.grid(alpha  = 1, lambda = 10^seq(-4, log10(0.5), length.out = 60))
+)
+
+cat("LASSO (Best lambda):", round(lasso_model$bestTune$lambda, 5),
+    "CV MSE:", round(min(lasso_model$results$RMSE)^2, 4), "\n")
+ 
+# Non-zero coefficients at the best lambda
+lasso_coefs <- coef(lasso_model$finalModel, s = lasso_model$bestTune$lambda)
+lasso_coef_df <- data.frame(
+  Predictor   = rownames(lasso_coefs),
+  Coefficient = as.numeric(lasso_coefs)
+) %>%
+  filter(Predictor != "(Intercept)", Coefficient != 0) %>%
+  arrange(desc(abs(Coefficient)))
+ 
+ggplot(lasso_coef_df, aes(x = reorder(Predictor, Coefficient),
+                          y = Coefficient, fill = Coefficient > 0)) +
+  geom_col() +
+  scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "maroon"),
+                    guide = "none") +
+  coord_flip() +
+  labs(title = "LASSO: Non-Zero Coefficients at the Best Lambda", y = "Coefficient") +
+  theme_minimal()
+ 
+# Model 4: Elastic Net
+enet_model <- train(
+  x = X_mat_train,
+  y = y_train,
+  method = "glmnet",
+  trControl = cv_ctrl,
+  tuneGrid = expand.grid(alpha  = seq(0, 1, by = 0.2), lambda = 10^seq(-4, log10(0.5), length.out = 30))
+)
+
+cat("Elastic Net (Best alpha):", enet_model$bestTune$alpha,
+    "Best lambda:", round(enet_model$bestTune$lambda, 5),
+    "CV MSE:", round(min(enet_model$results$RMSE)^2, 4), "\n")
+
+ggplot(enet_model$results %>% mutate(MSE = RMSE^2),
+       aes(x = log10(lambda), y = factor(alpha), fill = MSE)) +
+  geom_tile() +
+  scale_fill_gradient(low = "steelblue", high = "white") +
+  labs(title = "Elastic Net: CV MSE Across Tuning Grid", x = "log10(lambda)", y = "alpha") +
+  theme_minimal()
+```
+
+```{r}
+# TREE MODELS (Single Regression Tree, Random Forest)
+ 
+# Model 5: Single Regression Tree
+tree_grid  <- expand.grid(cp = seq(0.0001, 0.02, length.out = 30))
+ 
+tree_model <- train(
+  x = X_train_df,
+  y = y_train,
+  method = "rpart",
+  trControl = cv_ctrl,
+  tuneGrid = tree_grid
+)
+
+cat("Single Tree (Best cp):", round(tree_model$bestTune$cp, 6),
+    "CV MSE:", round(min(tree_model$results$RMSE)^2, 4), "\n")
+ 
+
+ggplot(tree_model$results %>% mutate(MSE = RMSE^2),
+       aes(x = cp, y = MSE)) +
+  geom_line(color = "steelblue") +
+  geom_vline(xintercept = tree_model$bestTune$cp,
+             linetype = "dashed", color = "black") +
+  labs(title = "Single Tree: CV MSE vs Complexity Parameter (cp)",
+       subtitle = "Black line = selected cp",
+       x = "cp", y = "MSE") +
+  theme_minimal()
+ 
+# Fit a shallow tree capped at four levels for interpretability
+shallow_tree <- rpart(log_price ~ .,
+                      data    = cbind(X_train_df, log_price = y_train),
+                      control = rpart.control(maxdepth = 4, cp = 0.001))
+
+rpart.plot(shallow_tree,
+           type = 2,
+           extra = 0,
+           fallen.leaves = TRUE,
+           tweak = 1.2,
+           main = "Regression Tree for log(Price): Top Four  Levels")
+ 
+# Model 6: Random Forest
+rf_grid  <- expand.grid(mtry = c(3, 4, 5, 6, 8))
+ 
+rf_model <- train(
+  x = X_train_df,
+  y = y_train,
+  method = "rf",
+  trControl = cv_ctrl,
+  tuneGrid = rf_grid,
+  ntree = 500,
+  importance = TRUE
+)
+ 
+
+cat("Random Forest (Best mtry):", rf_model$bestTune$mtry,
+    "CV MSE:", round(min(rf_model$results$RMSE)^2, 4), "\n")
+ 
+rf_oob_MSE <- rf_model$finalModel$mse[500]
+cat("RF OoB MSE (log scale):", round(rf_oob_MSE, 4), "\n")
+ 
+ggplot(rf_model$results %>% mutate(MSE = RMSE^2),
+       aes(x = mtry, y = MSE)) +
+  geom_line(color = "steelblue") +
+  geom_point(color = "steelblue", size = 2) +
+  geom_vline(xintercept = rf_model$bestTune$mtry,
+             linetype = "dashed", color = "black") +
+  labs(title = "Random Forest: CV MSE vs mtry",
+       subtitle = "Black line = selected mtry",
+       x = "mtry (predictors considered per split)", y = "MSE") +
+  theme_minimal()
+ 
+oob_df <- data.frame(trees  = seq_along(rf_model$finalModel$mse),
+                     oob_MSE = rf_model$finalModel$mse)
+ 
+ggplot(oob_df, aes(x = trees, y = oob_MSE)) +
+  geom_line(color = "steelblue") +
+  labs(title = "Random Forest: OoB MSE vs Number of Trees",
+       x = "Number of Trees", y = "OoB MSE (log scale)") +
+  theme_minimal()
+
+vip(rf_model, num_features = 15,
+    aesthetics = list(fill = "steelblue", color = "white")) +
+  labs(title = "Random Forest: Top 15 Predictors",
+       subtitle = "OoB Permutation Importance") +
+  theme_minimal()
+```
+
+
+```{r}
+# MODEL COMPARISON: Compares all 6 models on the same 5-fold MSE scale.
+
+# 6A. Collect results from all 6 caret models
+caret_cv <- resamples(list(
+  OLS = ols_model,
+  Ridge = ridge_model,
+  LASSO = lasso_model,
+  ElasticNet = enet_model,
+  SingleTree = tree_model,
+  RandomForest = rf_model
+))
+
+# 6B. MSE Comparison
+cv_long <- caret_cv$values %>%
+  select(-Resample) %>%
+  pivot_longer(everything(), names_to = "key", values_to = "value") %>%
+  filter(grepl("RMSE", key)) %>%
+  mutate(value = value^2,
+         Model = str_remove(key, "~RMSE"))
+
+ggplot(cv_long, aes(x = reorder(Model, value, median),
+                    y = value, fill = Model)) +
+  geom_boxplot(outlier.shape = 21, show.legend = FALSE) +
+  coord_flip() +
+  labs(title = "5-Fold CV MSE by Model (log-price scale)", y = "MSE") +
+  theme_minimal()
+ 
+# 6C. R-squared comparison
+r2_long <- caret_cv$values %>%
+  select(-Resample) %>%
+  pivot_longer(everything(), names_to = "key", values_to = "value") %>%
+  filter(grepl("Rsquared", key)) %>%
+  mutate(Model = str_remove(key, "~Rsquared"))
+ 
+ggplot(r2_long, aes(x = reorder(Model, value, median),
+                    y = value, fill = Model)) +
+  geom_boxplot(outlier.shape = 21, show.legend = FALSE) +
+  coord_flip() +
+  labs(title = "5-Fold R-Squared by Model", y = "R-Squared") +
+  theme_minimal()
+ 
+# 6D. Summary Table
+cv_rmse_summary <- summary(caret_cv)$statistics$RMSE
+cv_summary <- cv_rmse_summary^2
+cat("\nModel CV MSE comparison:\n")
+print(round(cv_summary[, c("Mean", "Min.", "Max.")], 4))
+```
+
+```{r}
+# PREDICTIONS AND DIAGNOSTIC TESTS
+
+# 7A. Identify best model by mean CV MSE
+best_name <- rownames(cv_rmse_summary)[which.min(cv_rmse_summary[, "Mean"])]
+cat("Best model by mean CV MSE:", best_name,
+    "MSE:", round(cv_summary[best_name, "Mean"], 4), "\n")
+ 
+model_lookup <- list(
+  OLS = ols_model,
+  Ridge = ridge_model,
+  LASSO = lasso_model,
+  ElasticNet = enet_model,
+  SingleTree = tree_model,
+  RandomForest = rf_model
+)
+best_model <- model_lookup[[best_name]]
+ 
+# 7B. Generate test predictions
+if (best_name %in% c("RandomForest", "SingleTree")) {
+  log_preds <- predict(best_model, newdata = X_test_df)
+} else {
+  log_preds <- predict(best_model, newdata = X_mat_test)
+}
+
+# reverse log transform to USD 
+price_preds <- exp(log_preds)   
+ 
+cat("Predicted price range: $", round(min(price_preds), 2),
+    "to $", round(max(price_preds), 2), "\n")
+cat("Predicted price mean:  $", round(mean(price_preds), 2), "\n")
+ 
+ggplot(data.frame(price = price_preds), aes(x = price)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  labs(title = "Distribution of Predicted Test Prices",
+       x = "Predicted Price (USD)", y = "Count") +
+  theme_minimal()
+
+# 7C. Diagnostic plots on training set
+if (best_name %in% c("RandomForest", "SingleTree")) {
+  train_preds <- predict(best_model, newdata = X_train_df)
+} else {
+  train_preds <- predict(best_model, newdata = X_mat_train)
+}
+ 
+resid_df <- data.frame(
+  fitted   = train_preds,
+  residual = y_train - train_preds
+)
+ 
+# Residuals vs Fitted
+ggplot(resid_df, aes(x = fitted, y = residual)) +
+  geom_point(alpha = 0.2, color = "steelblue") +
+  geom_hline(yintercept = 0, color = "maroon", linetype = "dashed") +
+  geom_smooth(method = "loess", color = "darkblue", se = TRUE) +
+  labs(title = paste("Residuals vs Fitted:", best_name),
+       x = "Fitted log(Price)", y = "Residual") +
+  theme_minimal()
+ 
+# Actual vs Predicted in USD
+ggplot(data.frame(actual = exp(y_train),
+                  predicted = exp(train_preds)),
+       aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.2, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, color = "maroon",
+              linetype = "dashed", linewidth = 0.8) +
+  labs(title = paste("Actual vs Predicted Price:", best_name),
+       x = "Actual Price (USD)", y = "Predicted Price (USD)") +
+  theme_minimal()
+```
+
