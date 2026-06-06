@@ -1,4 +1,5 @@
 **Airbnb Pricing Prediction Model**
+
 A machine learning pipeline in R that predicts Airbnb listing prices in the Minneapolis–St. Paul market from listing-level features. The project compares six regression approaches under a unified cross-validation framework and produces a final set of price predictions for a held-out test set.
 
 **Overview**
@@ -24,12 +25,12 @@ Model-matrix construction with dummy encoding aligned between train and test so 
 
 All six models are fit on log(price) and evaluated with 10-fold CV (via caret / glmnet):
 
-OLS — baseline linear regression.
-Regularized regression — Lasso, Ridge, and Elastic Net.
-Regression tree — single CART tree.
-Bagging — bootstrap-aggregated trees.
-Random forest — decorrelated tree ensemble.
-Gradient boosting — sequential boosted trees.
+OLS: baseline linear regression.
+Regularized regression: Lasso, Ridge, and Elastic Net.
+Regression tree: single CART tree.
+Bagging: bootstrap-aggregated trees.
+Random forest: decorrelated tree ensemble.
+Gradient boosting: sequential boosted trees.
 
 A model-comparison table reports cross-validated error for each, and predicted-vs-actual diagnostics are produced for the selected model.
 
