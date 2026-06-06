@@ -49,8 +49,6 @@ Cross-validated RMSE (back-transformed to the price scale)
 
 **Random Forest:** 0.3787
 
-Fill in the final CV RMSE values from the model-comparison table once you've run the notebook.
-
 Running the notebook reproduces the EDA, fits all six models, prints the comparison table, and writes submission.csv.
 Tech Stack
 R · R Markdown · caret · glmnet · tidyverse
