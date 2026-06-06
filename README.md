@@ -51,7 +51,7 @@ R · R Markdown · caret · glmnet · tidyverse
 
 **Context**
 
-Built as a statistical learning course project (STAT 1361) at the University of Pittsburgh.
+Built as a statistical learning course project (STAT1361) at the University of Pittsburgh.
 
 **Author**
 
