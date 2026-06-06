@@ -35,13 +35,19 @@ A model-comparison table reports cross-validated error for each, and predicted-v
 
 **Results**
 
-Cross-validated RMSE (back-transformed to the price scale):
-**OLS:           0.4432**
-**Ridge:         0.4435**
-**LASSO:         0.4425**
-**Elastic Net:   0.4415**
-**Single Tree:   0.4264**
-**Random Forest: 0.3787**
+Cross-validated RMSE (back-transformed to the price scale)
+
+OLS
+
+Ridge
+
+LASSO
+
+Elastic Net
+
+Single Tree
+
+Random Forest
 
 Fill in the final CV RMSE values from the model-comparison table once you've run the notebook.
 
